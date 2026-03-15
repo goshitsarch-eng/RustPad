@@ -1,19 +1,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use iced::keyboard;
-use iced::keyboard::key::Named;
-use iced::keyboard::Key;
 use iced::advanced::text::Wrapping;
+use iced::keyboard;
+use iced::keyboard::Key;
+use iced::keyboard::key::Named;
 use iced::widget::{
-    button, center, checkbox, column, container, mouse_area, opaque, radio, row, scrollable, stack,
-    text, text_editor, text_input, Space,
+    Space, button, center, checkbox, column, container, mouse_area, opaque, radio, row, scrollable,
+    stack, text, text_editor, text_input,
 };
 use iced::window;
-use iced::{font, Element, Fill, Font, Padding, Subscription, Task, Theme};
+use iced::{Element, Fill, Font, Length, Padding, Point, Subscription, Task, Theme, font};
 
 use crate::file_ops;
-use crate::menu::{self, MenuState};
+use crate::menu::{self, ContextMenuState, MenuState};
 use crate::message::{
     DialogKind, FindDirection, FontChoice, FontStyleChoice, MenuId, Message, PendingAction,
 };
@@ -29,6 +29,7 @@ pub struct RustPad {
 
     // Settings
     word_wrap: bool,
+    dark_mode: bool,
     font_size: f32,
     font_family: FontChoice,
     font_style: FontStyleChoice,
@@ -42,6 +43,8 @@ pub struct RustPad {
 
     // Menu
     active_menu: Option<MenuId>,
+    context_menu_position: Option<Point>,
+    editor_pointer_position: Point,
 
     // Dialogs
     dialog: Option<DialogKind>,
@@ -73,6 +76,7 @@ impl RustPad {
                 is_dirty: false,
                 undo_snapshot: None,
                 word_wrap: false,
+                dark_mode: false,
                 font_size: 16.0,
                 font_family: FontChoice::Monospace,
                 font_style: FontStyleChoice::Regular,
@@ -82,6 +86,8 @@ impl RustPad {
                 font_dialog_family_filter: String::from("Monospace"),
                 font_dialog_style_filter: String::from("Regular"),
                 active_menu: None,
+                context_menu_position: None,
+                editor_pointer_position: Point::ORIGIN,
                 dialog: None,
                 find_text: String::new(),
                 replace_text: String::new(),
@@ -110,14 +116,16 @@ impl RustPad {
     }
 
     pub fn theme(&self) -> Theme {
-        Theme::Light
+        if self.dark_mode {
+            Theme::Dark
+        } else {
+            Theme::Light
+        }
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
         let keys = keyboard::listen().map(|event| match event {
-            keyboard::Event::KeyPressed {
-                key, modifiers, ..
-            } => {
+            keyboard::Event::KeyPressed { key, modifiers, .. } => {
                 if modifiers.command() {
                     match key.as_ref() {
                         Key::Character("n") => Some(Message::NewFile),
@@ -143,17 +151,16 @@ impl RustPad {
 
         let close = window::close_requests().map(|_id| Some(Message::CloseRequested));
 
-        Subscription::batch([keys, close]).map(|msg| msg.unwrap_or(Message::CloseMenus))
+        Subscription::batch([keys, close]).map(|msg| msg.unwrap_or(Message::Ignored))
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Ignored => Task::none(),
             Message::EditorAction(action) => {
                 // Snapshot for undo on first edit
                 if action.is_edit() {
-                    if self.undo_snapshot.is_none() || !self.is_dirty {
-                        self.undo_snapshot = Some(self.content.text());
-                    }
+                    self.capture_undo_snapshot();
                     self.is_dirty = true;
                 }
                 self.content.perform(action);
@@ -165,6 +172,7 @@ impl RustPad {
                 if self.is_dirty {
                     self.pending_action = Some(PendingAction::New);
                     self.dialog = Some(DialogKind::SavePrompt);
+                    self.close_menus();
                     return Task::none();
                 }
                 self.do_new_file();
@@ -174,29 +182,40 @@ impl RustPad {
                 if self.is_dirty {
                     self.pending_action = Some(PendingAction::Open);
                     self.dialog = Some(DialogKind::SavePrompt);
+                    self.close_menus();
                     return Task::none();
                 }
                 self.close_menus();
                 Task::perform(file_ops::open_file(), Message::FileOpened)
             }
             Message::FileOpened(result) => {
-                if let Ok((path, contents)) = result {
-                    self.content = text_editor::Content::with_text(&contents);
-                    self.file_path = Some(path);
-                    self.is_dirty = false;
-                    self.undo_snapshot = None;
+                match result {
+                    Ok((path, contents)) => {
+                        self.content = text_editor::Content::with_text(&contents);
+                        self.file_path = Some(path);
+                        self.is_dirty = false;
+                        self.undo_snapshot = None;
+                        self.alert_message = None;
 
-                    // .LOG feature: auto-insert timestamp
-                    if contents.starts_with(".LOG") {
-                        let timestamp =
-                            chrono::Local::now().format("\n%I:%M %p %m/%d/%Y\n").to_string();
-                        self.content.perform(text_editor::Action::Move(
-                            text_editor::Motion::DocumentEnd,
-                        ));
-                        self.content.perform(text_editor::Action::Edit(
-                            text_editor::Edit::Paste(Arc::new(timestamp)),
-                        ));
-                        self.is_dirty = true;
+                        // .LOG feature: auto-insert timestamp
+                        if contents.starts_with(".LOG") {
+                            self.capture_undo_snapshot();
+                            let timestamp = chrono::Local::now()
+                                .format("\n%I:%M %p %m/%d/%Y\n")
+                                .to_string();
+                            self.content.perform(text_editor::Action::Move(
+                                text_editor::Motion::DocumentEnd,
+                            ));
+                            self.content.perform(text_editor::Action::Edit(
+                                text_editor::Edit::Paste(Arc::new(timestamp)),
+                            ));
+                            self.is_dirty = true;
+                        }
+                    }
+                    Err(file_ops::FileError::DialogClosed) => {}
+                    Err(error) => {
+                        self.pending_action = None;
+                        self.show_alert(error.to_string());
                     }
                 }
                 Task::none()
@@ -205,28 +224,32 @@ impl RustPad {
                 self.close_menus();
                 let path = self.file_path.clone();
                 let contents = self.content.text();
-                Task::perform(
-                    file_ops::save_file(path, contents),
-                    Message::FileSaved,
-                )
+                Task::perform(file_ops::save_file(path, contents), Message::FileSaved)
             }
             Message::SaveFileAs => {
                 self.close_menus();
                 let contents = self.content.text();
-                Task::perform(
-                    file_ops::save_file(None, contents),
-                    Message::FileSaved,
-                )
+                Task::perform(file_ops::save_file(None, contents), Message::FileSaved)
             }
             Message::FileSaved(result) => {
-                if let Ok(path) = result {
-                    self.file_path = Some(path);
-                    self.is_dirty = false;
-                    self.undo_snapshot = None;
+                match result {
+                    Ok(path) => {
+                        self.file_path = Some(path);
+                        self.is_dirty = false;
+                        self.undo_snapshot = None;
+                        self.alert_message = None;
 
-                    // Execute pending action after save
-                    if let Some(action) = self.pending_action.take() {
-                        return self.execute_pending_action(action);
+                        // Execute pending action after save
+                        if let Some(action) = self.pending_action.take() {
+                            return self.execute_pending_action(action);
+                        }
+                    }
+                    Err(file_ops::FileError::DialogClosed) => {
+                        self.pending_action = None;
+                    }
+                    Err(error) => {
+                        self.pending_action = None;
+                        self.show_alert(error.to_string());
                     }
                 }
                 Task::none()
@@ -235,6 +258,7 @@ impl RustPad {
                 if self.is_dirty {
                     self.pending_action = Some(PendingAction::Exit);
                     self.dialog = Some(DialogKind::SavePrompt);
+                    self.close_menus();
                     Task::none()
                 } else {
                     iced::exit()
@@ -249,6 +273,7 @@ impl RustPad {
                     self.undo_snapshot = Some(current);
                     self.is_dirty = true;
                 }
+                self.close_menus();
                 Task::none()
             }
             Message::Cut => {
@@ -256,6 +281,7 @@ impl RustPad {
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         let _ = clipboard.set_text(&selection);
                     }
+                    self.capture_undo_snapshot();
                     self.content
                         .perform(text_editor::Action::Edit(text_editor::Edit::Delete));
                     self.is_dirty = true;
@@ -275,9 +301,11 @@ impl RustPad {
             Message::Paste => {
                 if let Ok(mut clipboard) = arboard::Clipboard::new() {
                     if let Ok(text) = clipboard.get_text() {
-                        self.content.perform(text_editor::Action::Edit(
-                            text_editor::Edit::Paste(Arc::new(text)),
-                        ));
+                        self.capture_undo_snapshot();
+                        self.content
+                            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                                Arc::new(text),
+                            )));
                         self.is_dirty = true;
                     }
                 }
@@ -285,6 +313,7 @@ impl RustPad {
                 Task::none()
             }
             Message::Delete => {
+                self.capture_undo_snapshot();
                 self.content
                     .perform(text_editor::Action::Edit(text_editor::Edit::Delete));
                 self.is_dirty = true;
@@ -292,18 +321,17 @@ impl RustPad {
                 Task::none()
             }
             Message::SelectAll => {
-                self.content
-                    .perform(text_editor::Action::SelectAll);
+                self.content.perform(text_editor::Action::SelectAll);
                 self.close_menus();
                 Task::none()
             }
             Message::InsertTimeDate => {
-                let timestamp = chrono::Local::now()
-                    .format("%I:%M %p %m/%d/%Y")
-                    .to_string();
-                self.content.perform(text_editor::Action::Edit(
-                    text_editor::Edit::Paste(Arc::new(timestamp)),
-                ));
+                let timestamp = chrono::Local::now().format("%I:%M %p %m/%d/%Y").to_string();
+                self.capture_undo_snapshot();
+                self.content
+                    .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                        Arc::new(timestamp),
+                    )));
                 self.is_dirty = true;
                 self.close_menus();
                 Task::none()
@@ -312,6 +340,11 @@ impl RustPad {
                 self.word_wrap = !self.word_wrap;
                 // Win98: status bar disabled when word wrap is on
                 self.show_status_bar = !self.word_wrap;
+                self.close_menus();
+                Task::none()
+            }
+            Message::ToggleDarkMode => {
+                self.dark_mode = !self.dark_mode;
                 self.close_menus();
                 Task::none()
             }
@@ -351,8 +384,9 @@ impl RustPad {
                 Task::none()
             }
             Message::GoToLine => {
-                self.do_goto_line();
-                self.dialog = None;
+                if self.do_goto_line() {
+                    self.dialog = None;
+                }
                 Task::none()
             }
 
@@ -367,6 +401,15 @@ impl RustPad {
             }
             Message::GoToLineChanged(val) => {
                 self.goto_line_text = val;
+                Task::none()
+            }
+            Message::EditorPointerMoved(position) => {
+                self.editor_pointer_position = position;
+                Task::none()
+            }
+            Message::OpenEditorContextMenu => {
+                self.active_menu = None;
+                self.context_menu_position = Some(self.editor_pointer_position);
                 Task::none()
             }
             Message::ToggleCaseSensitive(val) => {
@@ -386,12 +429,16 @@ impl RustPad {
                 Task::none()
             }
             Message::CloseDialog => {
+                if self.dialog == Some(DialogKind::SavePrompt) {
+                    self.pending_action = None;
+                }
                 self.dialog = None;
                 Task::none()
             }
 
             // -- Menu --
             Message::MenuClicked(id) => {
+                self.context_menu_position = None;
                 if self.active_menu == Some(id) {
                     self.active_menu = None;
                 } else {
@@ -416,10 +463,7 @@ impl RustPad {
                 self.dialog = None;
                 let path = self.file_path.clone();
                 let contents = self.content.text();
-                Task::perform(
-                    file_ops::save_file(path, contents),
-                    Message::FileSaved,
-                )
+                Task::perform(file_ops::save_file(path, contents), Message::FileSaved)
             }
             Message::SavePromptDontSave => {
                 self.dialog = None;
@@ -439,15 +483,14 @@ impl RustPad {
                 self.font_dialog_family = self.font_family;
                 self.font_dialog_style = self.font_style;
                 self.font_dialog_size_text = self.font_size.to_string();
-                self.font_dialog_family_filter = self.font_family.to_string();
-                self.font_dialog_style_filter = self.font_style.to_string();
+                self.font_dialog_family_filter.clear();
+                self.font_dialog_style_filter.clear();
                 self.dialog = Some(DialogKind::Font);
                 self.close_menus();
                 Task::none()
             }
             Message::FontFamilyChanged(choice) => {
                 self.font_dialog_family = choice;
-                self.font_dialog_family_filter = choice.to_string();
                 Task::none()
             }
             Message::FontFamilyFilterChanged(val) => {
@@ -456,7 +499,6 @@ impl RustPad {
             }
             Message::FontStyleChanged(choice) => {
                 self.font_dialog_style = choice;
-                self.font_dialog_style_filter = choice.to_string();
                 Task::none()
             }
             Message::FontStyleFilterChanged(val) => {
@@ -486,11 +528,10 @@ impl RustPad {
                 let contents = self.content.text();
                 Task::perform(file_ops::print_file(contents), Message::PrintResult)
             }
-            Message::PrintResult(_) => Task::none(),
-
-            // Stubs
-            Message::PageSetup => {
-                self.close_menus();
+            Message::PrintResult(result) => {
+                if let Err(error) = result {
+                    self.show_alert(error.to_string());
+                }
                 Task::none()
             }
         }
@@ -530,21 +571,23 @@ impl RustPad {
             ed
         };
 
-        let editor_with_border = container(editor)
-            .style(t::win98_sunken_editor_style)
-            .width(Fill)
-            .height(Fill);
+        let editor_with_border = mouse_area(
+            container(editor)
+                .style(t::win98_sunken_editor_style)
+                .width(Fill)
+                .height(Fill),
+        )
+        .on_move(Message::EditorPointerMoved)
+        .on_right_press(Message::OpenEditorContextMenu);
 
         let status_bar: Element<'_, Message> = if self.show_status_bar {
             let (line, col) = self.cursor_position();
             container(
                 row![
                     Space::new().width(Fill),
-                    container(
-                        text(format!("Ln {}, Col {}", line, col)).size(12),
-                    )
-                    .style(t::win98_sunken_container_style)
-                    .padding(Padding::from([1, 8])),
+                    container(text(format!("Ln {}, Col {}", line, col)).size(12),)
+                        .style(t::win98_sunken_container_style)
+                        .padding(Padding::from([1, 8])),
                 ]
                 .padding(Padding::from([2, 4])),
             )
@@ -556,7 +599,28 @@ impl RustPad {
             Space::new().into()
         };
 
-        let below_menu = column![editor_with_border, status_bar];
+        let below_menu: Element<'_, Message> = if let Some(position) = self.context_menu_position {
+            let context_menu_state = ContextMenuState {
+                has_undo: self.undo_snapshot.is_some(),
+                has_selection: self.content.selection().is_some(),
+            };
+            let context_menu = menu::view_context_menu(&context_menu_state);
+
+            stack![
+                column![editor_with_border, status_bar],
+                mouse_area(container(Space::new()).width(Fill).height(Fill))
+                    .on_press(Message::CloseMenus),
+                container(opaque(context_menu)).padding(Padding {
+                    top: position.y,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: position.x,
+                })
+            ]
+            .into()
+        } else {
+            column![editor_with_border, status_bar].into()
+        };
 
         // Layer dropdown menu if active — menu_bar stays ABOVE the overlay
         // so hover-to-switch between menu buttons keeps working.
@@ -565,26 +629,19 @@ impl RustPad {
                 has_undo: self.undo_snapshot.is_some(),
                 has_selection: self.content.selection().is_some(),
                 word_wrap: self.word_wrap,
+                dark_mode: self.dark_mode,
             };
             let dropdown = menu::view_dropdown(menu_id, &menu_state);
 
-            let x_offset = match menu_id {
-                MenuId::File => 0.0,
-                MenuId::Edit => 40.0,
-                MenuId::Format => 76.0,
-                MenuId::Search => 130.0,
-                MenuId::Help => 182.0,
-            };
+            let x_offset = menu::menu_x_offset(menu_id);
 
             column![
                 menu_bar,
                 stack![
                     below_menu,
                     // Full-area click catcher (closes menu on click outside)
-                    mouse_area(
-                        container(Space::new()).width(Fill).height(Fill)
-                    )
-                    .on_press(Message::CloseMenus),
+                    mouse_area(container(Space::new()).width(Fill).height(Fill))
+                        .on_press(Message::CloseMenus),
                     // Dropdown: opaque so clicks on it don't close the menu
                     container(opaque(dropdown)).padding(Padding {
                         top: 0.0,
@@ -629,12 +686,8 @@ impl RustPad {
             let alert = self.view_alert_dialog(msg);
             stack![
                 with_dialog,
-                mouse_area(
-                    container(opaque(center(alert)))
-                        .width(Fill)
-                        .height(Fill),
-                )
-                .on_press(Message::DismissAlert)
+                mouse_area(container(opaque(center(alert))).width(Fill).height(Fill),)
+                    .on_press(Message::DismissAlert)
             ]
             .into()
         } else {
@@ -647,10 +700,7 @@ impl RustPad {
     fn dialog_title_bar(title: &str) -> Element<'_, Message> {
         container(
             row![
-                text(title)
-                    .size(12)
-                    .color(iced::Color::WHITE)
-                    .width(Fill),
+                text(title).size(12).color(iced::Color::WHITE).width(Fill),
                 button(text("X").size(10).color(iced::Color::WHITE))
                     .on_press(Message::CloseDialog)
                     .style(t::dialog_title_bar_close_style)
@@ -704,12 +754,22 @@ impl RustPad {
                         column![
                             text("Direction").size(12),
                             row![
-                                radio("Up", FindDirection::Up, Some(self.find_direction), Message::FindDirectionChanged)
-                                    .size(14)
-                                    .text_size(13),
-                                radio("Down", FindDirection::Down, Some(self.find_direction), Message::FindDirectionChanged)
-                                    .size(14)
-                                    .text_size(13),
+                                radio(
+                                    "Up",
+                                    FindDirection::Up,
+                                    Some(self.find_direction),
+                                    Message::FindDirectionChanged
+                                )
+                                .size(14)
+                                .text_size(13),
+                                radio(
+                                    "Down",
+                                    FindDirection::Down,
+                                    Some(self.find_direction),
+                                    Message::FindDirectionChanged
+                                )
+                                .size(14)
+                                .text_size(13),
                             ]
                             .spacing(8),
                         ]
@@ -728,10 +788,11 @@ impl RustPad {
             .spacing(0),
         )
         .style(t::dialog_container_style)
-        .padding(0);
+        .padding(0)
+        .width(Length::Fixed(420.0));
 
         mouse_area(opaque(content))
-            .on_press(Message::FindTextChanged(self.find_text.clone())) // absorb click
+            .on_press(Message::Ignored)
             .into()
     }
 
@@ -801,10 +862,11 @@ impl RustPad {
             .spacing(0),
         )
         .style(t::dialog_container_style)
-        .padding(0);
+        .padding(0)
+        .width(Length::Fixed(420.0));
 
         mouse_area(opaque(content))
-            .on_press(Message::ReplaceTextChanged(self.replace_text.clone()))
+            .on_press(Message::Ignored)
             .into()
     }
 
@@ -837,10 +899,11 @@ impl RustPad {
             .spacing(0),
         )
         .style(t::dialog_container_style)
-        .padding(0);
+        .padding(0)
+        .width(Length::Fixed(260.0));
 
         mouse_area(opaque(content))
-            .on_press(Message::GoToLineChanged(self.goto_line_text.clone()))
+            .on_press(Message::Ignored)
             .into()
     }
 
@@ -849,10 +912,22 @@ impl RustPad {
             column![
                 Self::dialog_title_bar("About RustPad"),
                 column![
-                    text("RustPad").size(20),
-                    text("A Windows 98 Notepad clone").size(13),
-                    text("Built with Rust and Iced").size(13),
-                    text("Version 0.1.0").size(12),
+                    text("RustPad")
+                        .size(20)
+                        .width(Fill)
+                        .align_x(iced::alignment::Horizontal::Center),
+                    text("A Windows 98 Notepad clone")
+                        .size(13)
+                        .width(Fill)
+                        .align_x(iced::alignment::Horizontal::Center),
+                    text("Built with Rust and Iced")
+                        .size(13)
+                        .width(Fill)
+                        .align_x(iced::alignment::Horizontal::Center),
+                    text("Version 0.1.0")
+                        .size(12)
+                        .width(Fill)
+                        .align_x(iced::alignment::Horizontal::Center),
                     button(text("OK").size(13))
                         .on_press(Message::CloseDialog)
                         .padding(Padding::from([4, 20]))
@@ -865,10 +940,11 @@ impl RustPad {
             .spacing(0),
         )
         .style(t::dialog_container_style)
-        .padding(0);
+        .padding(0)
+        .width(Length::Fixed(280.0));
 
         mouse_area(opaque(content))
-            .on_press(Message::ShowAbout) // absorb click
+            .on_press(Message::Ignored)
             .into()
     }
 
@@ -884,10 +960,7 @@ impl RustPad {
             column![
                 Self::dialog_title_bar("RustPad"),
                 column![
-                    text(format!(
-                        "Do you want to save changes to {filename}?"
-                    ))
-                    .size(14),
+                    text(format!("Do you want to save changes to {filename}?")).size(14),
                     row![
                         button(text("Save").size(13))
                             .on_press(Message::SavePromptSave)
@@ -911,10 +984,11 @@ impl RustPad {
             .spacing(0),
         )
         .style(t::dialog_container_style)
-        .padding(0);
+        .padding(0)
+        .width(Length::Fixed(360.0));
 
         mouse_area(opaque(content))
-            .on_press(Message::SavePromptCancel) // absorb click, treat as cancel
+            .on_press(Message::Ignored)
             .into()
     }
 
@@ -969,12 +1043,9 @@ impl RustPad {
                 .size(13)
                 .width(Fill)
                 .style(t::win98_text_input_style),
-            container(
-                scrollable(column(font_items).spacing(0).width(Fill))
-                    .height(100),
-            )
-            .style(t::win98_sunken_container_style)
-            .width(Fill),
+            container(scrollable(column(font_items).spacing(0).width(Fill)).height(100),)
+                .style(t::win98_sunken_container_style)
+                .width(Fill),
         ]
         .spacing(2)
         .width(160);
@@ -1011,26 +1082,22 @@ impl RustPad {
                 .size(13)
                 .width(Fill)
                 .style(t::win98_text_input_style),
-            container(
-                scrollable(column(style_items).spacing(0).width(Fill))
-                    .height(100),
-            )
-            .style(t::win98_sunken_container_style)
-            .width(Fill),
+            container(scrollable(column(style_items).spacing(0).width(Fill)).height(100),)
+                .style(t::win98_sunken_container_style)
+                .width(Fill),
         ]
         .spacing(2)
         .width(120);
 
         // Size scrollable list
         let sizes = [
-            "8", "9", "10", "11", "12", "14", "16", "18", "20", "22", "24", "26", "28", "36",
-            "48", "72",
+            "8", "9", "10", "11", "12", "14", "16", "18", "20", "22", "24", "26", "28", "36", "48",
+            "72",
         ];
         let size_items: Vec<Element<'_, Message>> = sizes
             .iter()
             .filter(|s| {
-                self.font_dialog_size_text.is_empty()
-                    || s.starts_with(&self.font_dialog_size_text)
+                self.font_dialog_size_text.is_empty() || s.starts_with(&self.font_dialog_size_text)
             })
             .map(|&s| {
                 let is_selected = s == self.font_dialog_size_text;
@@ -1056,12 +1123,9 @@ impl RustPad {
                 .size(13)
                 .width(Fill)
                 .style(t::win98_text_input_style),
-            container(
-                scrollable(column(size_items).spacing(0).width(Fill))
-                    .height(100),
-            )
-            .style(t::win98_sunken_container_style)
-            .width(Fill),
+            container(scrollable(column(size_items).spacing(0).width(Fill)).height(100),)
+                .style(t::win98_sunken_container_style)
+                .width(Fill),
         ]
         .spacing(2)
         .width(70);
@@ -1073,12 +1137,10 @@ impl RustPad {
                     row![font_list, style_list, size_list,].spacing(12),
                     column![
                         text("Sample").size(11),
-                        container(
-                            text("AaBbYyZz").font(preview_font).size(preview_size),
-                        )
-                        .style(t::win98_sunken_container_style)
-                        .padding(12)
-                        .width(Fill),
+                        container(text("AaBbYyZz").font(preview_font).size(preview_size),)
+                            .style(t::win98_sunken_container_style)
+                            .padding(12)
+                            .width(Fill),
                     ]
                     .spacing(4),
                     row![
@@ -1099,10 +1161,11 @@ impl RustPad {
             .spacing(0),
         )
         .style(t::dialog_container_style)
-        .padding(0);
+        .padding(0)
+        .width(Length::Fixed(420.0));
 
         mouse_area(opaque(content))
-            .on_press(Message::FontSizeChanged(self.font_dialog_size_text.clone()))
+            .on_press(Message::Ignored)
             .into()
     }
 
@@ -1124,10 +1187,11 @@ impl RustPad {
             .spacing(0),
         )
         .style(t::dialog_container_style)
-        .padding(0);
+        .padding(0)
+        .width(Length::Fixed(320.0));
 
         mouse_area(opaque(content))
-            .on_press(Message::DismissAlert)
+            .on_press(Message::Ignored)
             .into()
     }
 
@@ -1135,6 +1199,7 @@ impl RustPad {
 
     fn close_menus(&mut self) {
         self.active_menu = None;
+        self.context_menu_position = None;
     }
 
     fn do_new_file(&mut self) {
@@ -1150,9 +1215,7 @@ impl RustPad {
                 self.do_new_file();
                 Task::none()
             }
-            PendingAction::Open => {
-                Task::perform(file_ops::open_file(), Message::FileOpened)
-            }
+            PendingAction::Open => Task::perform(file_ops::open_file(), Message::FileOpened),
             PendingAction::Exit => iced::exit(),
         }
     }
@@ -1162,21 +1225,14 @@ impl RustPad {
         (cursor.position.line + 1, cursor.position.column + 1)
     }
 
-    fn is_whole_word_match(&self, text: &str, pos: usize, len: usize) -> bool {
-        if !self.find_whole_word {
-            return true;
+    fn capture_undo_snapshot(&mut self) {
+        if self.undo_snapshot.is_none() || !self.is_dirty {
+            self.undo_snapshot = Some(self.content.text());
         }
-        let before_ok = pos == 0
-            || !text[..pos]
-                .chars()
-                .next_back()
-                .map_or(false, |c| c.is_alphanumeric() || c == '_');
-        let after_ok = pos + len >= text.len()
-            || !text[pos + len..]
-                .chars()
-                .next()
-                .map_or(false, |c| c.is_alphanumeric() || c == '_');
-        before_ok && after_ok
+    }
+
+    fn show_alert(&mut self, message: String) {
+        self.alert_message = Some(message);
     }
 
     fn do_find_next(&mut self) {
@@ -1185,58 +1241,16 @@ impl RustPad {
         }
 
         let full_text = self.content.text();
-        let cursor = self.content.cursor();
-        let cur_line = cursor.position.line;
-        let cur_col = cursor.position.column;
-
-        // Calculate byte offset from line/col
-        let mut offset = 0;
-        for (i, line) in full_text.lines().enumerate() {
-            if i == cur_line {
-                offset += cur_col;
-                break;
-            }
-            offset += line.len() + 1; // +1 for newline
-        }
-
-        // Search from cursor position
-        let search_text = if self.find_case_sensitive {
-            full_text.clone()
+        if let Some((start, len)) = self.find_match(
+            &full_text,
+            cursor_char_offset(&self.content, &full_text),
+            true,
+            true,
+        ) {
+            self.select_range(start, len, &full_text);
         } else {
-            full_text.to_lowercase()
-        };
-        let needle = if self.find_case_sensitive {
-            self.find_text.clone()
-        } else {
-            self.find_text.to_lowercase()
-        };
-
-        // Try from cursor, then wrap around
-        let found_offset = self
-            .find_forward(&search_text, &needle, offset)
-            .or_else(|| self.find_forward(&search_text, &needle, 0));
-
-        if let Some(byte_pos) = found_offset {
-            self.select_range(byte_pos, needle.len(), &full_text);
-        } else {
-            self.alert_message = Some(format!("Cannot find \"{}\"", self.find_text));
+            self.show_alert(format!("Cannot find \"{}\"", self.find_text));
         }
-    }
-
-    fn find_forward(&self, haystack: &str, needle: &str, start: usize) -> Option<usize> {
-        let mut pos = start;
-        while pos < haystack.len() {
-            if let Some(found) = haystack[pos..].find(needle) {
-                let abs = pos + found;
-                if self.is_whole_word_match(haystack, abs, needle.len()) {
-                    return Some(abs);
-                }
-                pos = abs + 1;
-            } else {
-                break;
-            }
-        }
-        None
     }
 
     fn do_find_previous(&mut self) {
@@ -1245,72 +1259,35 @@ impl RustPad {
         }
 
         let full_text = self.content.text();
-        let cursor = self.content.cursor();
-        let cur_line = cursor.position.line;
-        let cur_col = cursor.position.column;
-
-        let mut offset = 0;
-        for (i, line) in full_text.lines().enumerate() {
-            if i == cur_line {
-                offset += cur_col;
-                break;
-            }
-            offset += line.len() + 1;
-        }
-
-        let search_text = if self.find_case_sensitive {
-            full_text.clone()
+        if let Some((start, len)) = self.find_match(
+            &full_text,
+            cursor_char_offset(&self.content, &full_text),
+            false,
+            true,
+        ) {
+            self.select_range(start, len, &full_text);
         } else {
-            full_text.to_lowercase()
-        };
-        let needle = if self.find_case_sensitive {
-            self.find_text.clone()
-        } else {
-            self.find_text.to_lowercase()
-        };
-
-        let found_offset = self
-            .find_backward(&search_text, &needle, offset)
-            .or_else(|| self.find_backward(&search_text, &needle, search_text.len()));
-
-        if let Some(byte_pos) = found_offset {
-            self.select_range(byte_pos, needle.len(), &full_text);
-        } else {
-            self.alert_message = Some(format!("Cannot find \"{}\"", self.find_text));
+            self.show_alert(format!("Cannot find \"{}\"", self.find_text));
         }
-    }
-
-    fn find_backward(&self, haystack: &str, needle: &str, end: usize) -> Option<usize> {
-        let search_area = &haystack[..end.min(haystack.len())];
-        let mut last_valid = None;
-        let mut pos = 0;
-        while pos < search_area.len() {
-            if let Some(found) = search_area[pos..].find(needle) {
-                let abs = pos + found;
-                if self.is_whole_word_match(haystack, abs, needle.len()) {
-                    last_valid = Some(abs);
-                }
-                pos = abs + 1;
-            } else {
-                break;
-            }
-        }
-        last_valid
     }
 
     fn do_replace(&mut self) {
-        // If text is selected and matches find_text, replace it, then find next
         if let Some(selection) = self.content.selection() {
-            let matches = if self.find_case_sensitive {
-                selection == self.find_text
+            let full_text = self.content.text();
+            let selection_matches =
+                strings_match_case(&selection, &self.find_text, self.find_case_sensitive);
+            let is_whole_word_selection = if self.find_whole_word {
+                self.selection_matches_whole_word(&full_text)
             } else {
-                selection.to_lowercase() == self.find_text.to_lowercase()
+                true
             };
 
-            if matches {
-                self.content.perform(text_editor::Action::Edit(
-                    text_editor::Edit::Paste(Arc::new(self.replace_text.clone())),
-                ));
+            if selection_matches && is_whole_word_selection {
+                self.capture_undo_snapshot();
+                self.content
+                    .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                        Arc::new(self.replace_text.clone()),
+                    )));
                 self.is_dirty = true;
             }
         }
@@ -1323,66 +1300,74 @@ impl RustPad {
         }
 
         let full_text = self.content.text();
-        let new_text = if self.find_case_sensitive {
-            full_text.replace(&self.find_text, &self.replace_text)
-        } else {
-            // Case-insensitive replace
-            let mut result = String::new();
-            let lower = full_text.to_lowercase();
-            let needle = self.find_text.to_lowercase();
-            let mut last = 0;
-            for (start, _) in lower.match_indices(&needle) {
-                result.push_str(&full_text[last..start]);
-                result.push_str(&self.replace_text);
-                last = start + self.find_text.len();
-            }
-            result.push_str(&full_text[last..]);
-            result
+        let boundaries = char_boundaries(&full_text);
+        let mut replacements = Vec::new();
+        let mut cursor = 0;
+
+        while let Some((start, len)) = self.find_match(&full_text, cursor, true, false) {
+            replacements.push((start, len));
+            cursor = start + len.max(1);
+        }
+
+        if replacements.is_empty() {
+            self.show_alert(format!("Cannot find \"{}\"", self.find_text));
+            return;
+        }
+
+        let mut rebuilt = String::new();
+        let mut current_char = 0;
+
+        for (start, len) in replacements {
+            rebuilt.push_str(&full_text[boundaries[current_char]..boundaries[start]]);
+            rebuilt.push_str(&self.replace_text);
+            current_char = start + len;
+        }
+
+        rebuilt.push_str(&full_text[boundaries[current_char]..]);
+
+        self.undo_snapshot = Some(full_text);
+        self.content = text_editor::Content::with_text(&rebuilt);
+        self.is_dirty = true;
+    }
+
+    fn do_goto_line(&mut self) -> bool {
+        let Ok(line_num) = self.goto_line_text.trim().parse::<usize>() else {
+            self.show_alert("Enter a valid line number.".to_owned());
+            return false;
         };
 
-        if new_text != full_text {
-            self.undo_snapshot = Some(full_text);
-            self.content = text_editor::Content::with_text(&new_text);
-            self.is_dirty = true;
-        }
-    }
-
-    fn do_goto_line(&mut self) {
-        if let Ok(line_num) = self.goto_line_text.parse::<usize>() {
-            if line_num > 0 {
-                let target_line = line_num - 1;
-
-                // Move cursor to start of target line
-                self.content
-                    .perform(text_editor::Action::Move(text_editor::Motion::DocumentStart));
-                for _ in 0..target_line {
-                    self.content
-                        .perform(text_editor::Action::Move(text_editor::Motion::Down));
-                }
-                self.content
-                    .perform(text_editor::Action::Move(text_editor::Motion::Home));
-            }
-        }
-    }
-
-    fn select_range(&mut self, byte_pos: usize, len: usize, full_text: &str) {
-        // Convert byte position to line/col
-        let mut target_line = 0;
-        let mut target_col = 0;
-        let mut counted = 0;
-
-        for (i, line) in full_text.lines().enumerate() {
-            if counted + line.len() >= byte_pos {
-                target_line = i;
-                target_col = byte_pos - counted;
-                break;
-            }
-            counted += line.len() + 1; // +1 for newline
+        if line_num == 0 {
+            self.show_alert("Line numbers start at 1.".to_owned());
+            return false;
         }
 
-        // Move cursor to start of match
+        let total_lines = line_count(&self.content.text());
+        if line_num > total_lines {
+            self.show_alert(format!("The document only has {total_lines} line(s)."));
+            return false;
+        }
+
+        let target_line = line_num - 1;
+
+        self.content.perform(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        ));
+        for _ in 0..target_line {
+            self.content
+                .perform(text_editor::Action::Move(text_editor::Motion::Down));
+        }
         self.content
-            .perform(text_editor::Action::Move(text_editor::Motion::DocumentStart));
+            .perform(text_editor::Action::Move(text_editor::Motion::Home));
+
+        true
+    }
+
+    fn select_range(&mut self, start_char: usize, len_chars: usize, full_text: &str) {
+        let (target_line, target_col) = line_col_for_char_index(full_text, start_char);
+
+        self.content.perform(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        ));
         for _ in 0..target_line {
             self.content
                 .perform(text_editor::Action::Move(text_editor::Motion::Down));
@@ -1394,10 +1379,405 @@ impl RustPad {
                 .perform(text_editor::Action::Move(text_editor::Motion::Right));
         }
 
-        // Select the match
-        for _ in 0..len {
+        for _ in 0..len_chars {
             self.content
                 .perform(text_editor::Action::Select(text_editor::Motion::Right));
         }
+    }
+
+    fn find_match(
+        &self,
+        full_text: &str,
+        start_char: usize,
+        forward: bool,
+        wrap: bool,
+    ) -> Option<(usize, usize)> {
+        if self.find_text.is_empty() {
+            return None;
+        }
+
+        if self.find_case_sensitive {
+            let chars: Vec<char> = full_text.chars().collect();
+            let boundaries = char_boundaries(full_text);
+
+            if forward {
+                find_case_sensitive_forward(
+                    full_text,
+                    &self.find_text,
+                    &chars,
+                    &boundaries,
+                    start_char,
+                    self.find_whole_word,
+                )
+                .or_else(|| {
+                    if wrap {
+                        find_case_sensitive_forward(
+                            full_text,
+                            &self.find_text,
+                            &chars,
+                            &boundaries,
+                            0,
+                            self.find_whole_word,
+                        )
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                find_case_sensitive_backward(
+                    full_text,
+                    &self.find_text,
+                    &chars,
+                    &boundaries,
+                    start_char,
+                    self.find_whole_word,
+                )
+                .or_else(|| {
+                    if wrap {
+                        find_case_sensitive_backward(
+                            full_text,
+                            &self.find_text,
+                            &chars,
+                            &boundaries,
+                            chars.len(),
+                            self.find_whole_word,
+                        )
+                    } else {
+                        None
+                    }
+                })
+            }
+        } else {
+            let chars: Vec<char> = full_text.chars().collect();
+            let folded = FoldedText::new(full_text);
+            let folded_needle = fold_case(&self.find_text);
+
+            if forward {
+                find_folded_forward(
+                    &folded,
+                    &folded_needle,
+                    &chars,
+                    start_char,
+                    self.find_whole_word,
+                )
+                .or_else(|| {
+                    if wrap {
+                        find_folded_forward(
+                            &folded,
+                            &folded_needle,
+                            &chars,
+                            0,
+                            self.find_whole_word,
+                        )
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                find_folded_backward(
+                    &folded,
+                    &folded_needle,
+                    &chars,
+                    start_char,
+                    self.find_whole_word,
+                )
+                .or_else(|| {
+                    if wrap {
+                        find_folded_backward(
+                            &folded,
+                            &folded_needle,
+                            &chars,
+                            chars.len(),
+                            self.find_whole_word,
+                        )
+                    } else {
+                        None
+                    }
+                })
+            }
+        }
+    }
+
+    fn selection_matches_whole_word(&self, full_text: &str) -> bool {
+        let Some(selection) = self.content.selection() else {
+            return false;
+        };
+
+        if selection.is_empty() {
+            return false;
+        }
+
+        let cursor_offset = cursor_char_offset(&self.content, full_text);
+        let selection_len = selection.chars().count();
+        let start = cursor_offset.saturating_sub(selection_len);
+        let chars: Vec<char> = full_text.chars().collect();
+
+        is_whole_word_match(&chars, start, selection_len)
+    }
+}
+
+struct FoldedText {
+    text: String,
+    boundaries: Vec<usize>,
+}
+
+impl FoldedText {
+    fn new(source: &str) -> Self {
+        let mut text = String::new();
+        let mut boundaries = Vec::with_capacity(source.chars().count() + 1);
+        boundaries.push(0);
+
+        for ch in source.chars() {
+            text.extend(ch.to_lowercase());
+            boundaries.push(text.len());
+        }
+
+        Self { text, boundaries }
+    }
+}
+
+fn cursor_char_offset(content: &text_editor::Content, full_text: &str) -> usize {
+    let cursor = content.cursor();
+    let mut offset = 0;
+
+    for (line_index, line) in full_text.split('\n').enumerate() {
+        if line_index == cursor.position.line {
+            return offset + cursor.position.column.min(line.chars().count());
+        }
+
+        offset += line.chars().count() + 1;
+    }
+
+    full_text.chars().count()
+}
+
+fn line_count(text: &str) -> usize {
+    text.split('\n').count().max(1)
+}
+
+fn line_col_for_char_index(text: &str, target: usize) -> (usize, usize) {
+    let mut line = 0;
+    let mut col = 0;
+
+    for (index, ch) in text.chars().enumerate() {
+        if index == target {
+            break;
+        }
+
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+
+    (line, col)
+}
+
+fn char_boundaries(text: &str) -> Vec<usize> {
+    let mut boundaries = text.char_indices().map(|(idx, _)| idx).collect::<Vec<_>>();
+    boundaries.push(text.len());
+    boundaries
+}
+
+fn fold_case(text: &str) -> String {
+    text.chars().flat_map(|ch| ch.to_lowercase()).collect()
+}
+
+fn strings_match_case(left: &str, right: &str, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        left == right
+    } else {
+        fold_case(left) == fold_case(right)
+    }
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn is_whole_word_match(chars: &[char], start: usize, len: usize) -> bool {
+    let before_ok = start == 0 || !is_word_char(chars[start - 1]);
+    let after_index = start + len;
+    let after_ok = after_index >= chars.len() || !is_word_char(chars[after_index]);
+    before_ok && after_ok
+}
+
+fn next_boundary_after(boundaries: &[usize], value: usize) -> Option<usize> {
+    boundaries
+        .iter()
+        .copied()
+        .find(|boundary| *boundary > value)
+}
+
+fn find_case_sensitive_forward(
+    text: &str,
+    needle: &str,
+    chars: &[char],
+    boundaries: &[usize],
+    start_char: usize,
+    whole_word: bool,
+) -> Option<(usize, usize)> {
+    let mut search_from = boundaries[start_char.min(chars.len())];
+
+    while search_from <= text.len() {
+        let found = text[search_from..].find(needle)?;
+        let start_byte = search_from + found;
+        let end_byte = start_byte + needle.len();
+
+        let Ok(start) = boundaries.binary_search(&start_byte) else {
+            search_from = next_boundary_after(boundaries, start_byte)?;
+            continue;
+        };
+        let Ok(end) = boundaries.binary_search(&end_byte) else {
+            search_from = next_boundary_after(boundaries, start_byte)?;
+            continue;
+        };
+
+        let len = end - start;
+        if !whole_word || is_whole_word_match(chars, start, len) {
+            return Some((start, len));
+        }
+
+        search_from = boundaries[(start + 1).min(chars.len())];
+    }
+
+    None
+}
+
+fn find_case_sensitive_backward(
+    text: &str,
+    needle: &str,
+    chars: &[char],
+    boundaries: &[usize],
+    end_char: usize,
+    whole_word: bool,
+) -> Option<(usize, usize)> {
+    let search_end = boundaries[end_char.min(chars.len())];
+    let mut last_valid = None;
+
+    for (start_byte, _) in text[..search_end].match_indices(needle) {
+        let end_byte = start_byte + needle.len();
+        let Ok(start) = boundaries.binary_search(&start_byte) else {
+            continue;
+        };
+        let Ok(end) = boundaries.binary_search(&end_byte) else {
+            continue;
+        };
+
+        let len = end - start;
+        if !whole_word || is_whole_word_match(chars, start, len) {
+            last_valid = Some((start, len));
+        }
+    }
+
+    last_valid
+}
+
+fn find_folded_forward(
+    folded: &FoldedText,
+    needle: &str,
+    chars: &[char],
+    start_char: usize,
+    whole_word: bool,
+) -> Option<(usize, usize)> {
+    let mut search_from = folded.boundaries[start_char.min(chars.len())];
+
+    while search_from <= folded.text.len() {
+        let found = folded.text[search_from..].find(needle)?;
+        let start_byte = search_from + found;
+        let end_byte = start_byte + needle.len();
+
+        let Ok(start) = folded.boundaries.binary_search(&start_byte) else {
+            search_from = next_boundary_after(&folded.boundaries, start_byte)?;
+            continue;
+        };
+        let Ok(end) = folded.boundaries.binary_search(&end_byte) else {
+            search_from = next_boundary_after(&folded.boundaries, start_byte)?;
+            continue;
+        };
+
+        let len = end - start;
+        if !whole_word || is_whole_word_match(chars, start, len) {
+            return Some((start, len));
+        }
+
+        search_from = folded.boundaries[(start + 1).min(chars.len())];
+    }
+
+    None
+}
+
+fn find_folded_backward(
+    folded: &FoldedText,
+    needle: &str,
+    chars: &[char],
+    end_char: usize,
+    whole_word: bool,
+) -> Option<(usize, usize)> {
+    let search_end = folded.boundaries[end_char.min(chars.len())];
+    let mut last_valid = None;
+
+    for (start_byte, _) in folded.text[..search_end].match_indices(needle) {
+        let end_byte = start_byte + needle.len();
+        let Ok(start) = folded.boundaries.binary_search(&start_byte) else {
+            continue;
+        };
+        let Ok(end) = folded.boundaries.binary_search(&end_byte) else {
+            continue;
+        };
+
+        let len = end - start;
+        if !whole_word || is_whole_word_match(chars, start, len) {
+            last_valid = Some((start, len));
+        }
+    }
+
+    last_valid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FoldedText, char_boundaries, find_case_sensitive_forward, find_folded_forward, fold_case,
+        is_whole_word_match, strings_match_case,
+    };
+
+    #[test]
+    fn folded_search_respects_unicode_boundaries() {
+        let text = "Before İ after";
+        let chars: Vec<char> = text.chars().collect();
+        let folded = FoldedText::new(text);
+        let needle = fold_case("İ");
+
+        let found = find_folded_forward(&folded, &needle, &chars, 0, false);
+
+        assert_eq!(found, Some((7, 1)));
+    }
+
+    #[test]
+    fn case_sensitive_search_uses_character_indices() {
+        let text = "aébc";
+        let chars: Vec<char> = text.chars().collect();
+        let boundaries = char_boundaries(text);
+
+        let found = find_case_sensitive_forward(text, "éb", &chars, &boundaries, 0, false);
+
+        assert_eq!(found, Some((1, 2)));
+    }
+
+    #[test]
+    fn whole_word_check_respects_word_boundaries() {
+        let chars: Vec<char> = "foo bar_baz".chars().collect();
+
+        assert!(is_whole_word_match(&chars, 0, 3));
+        assert!(!is_whole_word_match(&chars, 4, 3));
+    }
+
+    #[test]
+    fn folded_string_comparison_matches_unicode_case() {
+        assert!(strings_match_case("İ", "i\u{307}", false));
+        assert!(!strings_match_case("Rust", "Dust", false));
     }
 }

@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use iced::Point;
 use iced::font;
 use iced::widget::text_editor;
 
@@ -90,6 +91,8 @@ impl fmt::Display for FontStyleChoice {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Ignored,
+
     // Text editor
     EditorAction(text_editor::Action),
 
@@ -111,6 +114,7 @@ pub enum Message {
     SelectAll,
     InsertTimeDate,
     ToggleWordWrap,
+    ToggleDarkMode,
 
     // Search operations
     OpenFindDialog,
@@ -135,6 +139,8 @@ pub enum Message {
     FindTextChanged(String),
     ReplaceTextChanged(String),
     GoToLineChanged(String),
+    EditorPointerMoved(Point),
+    OpenEditorContextMenu,
     ToggleCaseSensitive(bool),
     ToggleWholeWord(bool),
     FindDirectionChanged(FindDirection),
@@ -157,7 +163,6 @@ pub enum Message {
     CloseRequested,
 
     // Print
-    PageSetup,
     Print,
     PrintResult(Result<(), FileError>),
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rustpad"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A lightweight Notepad style editor built with Rust and Iced"
 repository = "https://github.com/goshitsarch-eng/RustPad"

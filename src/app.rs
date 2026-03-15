@@ -924,7 +924,7 @@ impl RustPad {
                         .size(13)
                         .width(Fill)
                         .align_x(iced::alignment::Horizontal::Center),
-                    text("Version 0.1.1")
+                    text("Version 0.1.2")
                         .size(12)
                         .width(Fill)
                         .align_x(iced::alignment::Horizontal::Center),

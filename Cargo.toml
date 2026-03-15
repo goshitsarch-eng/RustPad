@@ -1,6 +1,6 @@
 [package]
 name = "rustpad"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A lightweight Notepad style editor built with Rust and Iced"
 repository = "https://github.com/goshitsarch-eng/RustPad"
@@ -26,6 +26,7 @@ font selection, search and replace, and a right click context menu.
 out-dir = "dist"
 before-packaging-command = "cargo build --release"
 formats = ["appimage", "nsis", "app"]
+icons = ["assets/rustpad-icon.png", "assets/rustpad-icon.ico"]
 
 [profile.release]
 opt-level = 3

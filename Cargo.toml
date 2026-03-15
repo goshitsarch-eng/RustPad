@@ -2,12 +2,30 @@
 name = "rustpad"
 version = "0.1.0"
 edition = "2024"
+description = "A lightweight Notepad style editor built with Rust and Iced"
+repository = "https://github.com/goshitsarch-eng/RustPad"
 
 [dependencies]
 iced = { version = "0.14", features = ["tokio", "advanced"] }
 rfd = "0.15"
 chrono = "0.4"
 arboard = "3"
+
+[package.metadata.packager]
+product-name = "RustPad"
+identifier = "io.github.goshitsarcheng.rustpad"
+category = "Utility"
+publisher = "goshitsarch-eng"
+homepage = "https://github.com/goshitsarch-eng/RustPad"
+description = "A lightweight Notepad style editor built with Rust and Iced."
+long-description = """
+RustPad is a small desktop text editor built with Rust and Iced.
+It keeps the old school Notepad feel, but adds nicer defaults like dark mode,
+font selection, search and replace, and a right click context menu.
+"""
+out-dir = "dist"
+before-packaging-command = "cargo build --release"
+formats = ["appimage", "nsis", "app"]
 
 [profile.release]
 opt-level = 3

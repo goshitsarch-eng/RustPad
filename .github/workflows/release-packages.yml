@@ -1,0 +1,105 @@
+name: Release Packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux AppImage x64
+            runner: ubuntu-24.04
+            artifact_name: rustpad-appimage-x86_64
+            format: appimage
+          - name: Linux AppImage arm64
+            runner: ubuntu-24.04-arm
+            artifact_name: rustpad-appimage-aarch64
+            format: appimage
+          - name: Windows NSIS x64
+            runner: windows-latest
+            artifact_name: rustpad-nsis-x86_64
+            format: nsis
+          - name: macOS app arm64
+            runner: macos-14
+            artifact_name: rustpad-app-aarch64-apple-darwin
+            format: app
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Linux packaging dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            desktop-file-utils \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install Windows packaging dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install nsis --no-progress -y
+
+      - name: Install cargo-packager
+        shell: bash
+        run: cargo install cargo-packager --locked
+
+      - name: Build package
+        shell: bash
+        run: cargo packager --release --formats "${{ matrix.format }}"
+
+      - name: Show packaged files
+        shell: bash
+        run: find dist -maxdepth 3 -type f | sort
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/**/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/**/*
+          generate_release_notes: true

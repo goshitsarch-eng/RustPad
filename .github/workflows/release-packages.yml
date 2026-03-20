@@ -37,6 +37,10 @@ jobs:
             runner: macos-14
             artifact_name: rustpad-app-aarch64-apple-darwin
             format: app
+          - name: macOS dmg arm64
+            runner: macos-14
+            artifact_name: rustpad-dmg-aarch64-apple-darwin
+            format: dmg
 
     steps:
       - name: Check out repository

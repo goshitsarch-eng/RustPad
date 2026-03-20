@@ -101,7 +101,11 @@ pub fn save(settings: &Settings) -> Result<(), SettingsError> {
             .map_err(|error| io_error("create", Some(parent.to_path_buf()), error))?;
     }
 
-    let contents = format!("dark_mode={}\n", settings.dark_mode);
+    let contents = format!(
+        "version={}\ndark_mode={}\n",
+        env!("CARGO_PKG_VERSION"),
+        settings.dark_mode
+    );
     fs::write(&path, contents).map_err(|error| io_error("write", Some(path), error))?;
 
     Ok(())

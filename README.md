@@ -12,7 +12,7 @@ RustPad currently supports:
 - Word wrap and dark mode toggles
 - A right-click context menu for common edit actions
 - Time/date insertion with `F5`
-- Print support through the system `lp` command
+- Print support through the system print command (`lp`, `lpr`, or `notepad.exe /p` on Windows)
 - A single-level undo snapshot, similar to classic Notepad behavior
 - A `.LOG` workflow that appends a timestamp when opening files that start with `.LOG`
 
@@ -56,4 +56,4 @@ The final binary ends up at:
 
 If you want to package it locally, the repo is configured for `cargo packager` outputs in `dist/` using the `appimage`, `nsis`, `app`, and `dmg` formats.
 
-Printing goes through your system `lp` setup, so that part only works if your machine already has a printer configured and the print service is running.
+Printing goes through your system print service, so that part only works if your machine already has a printer configured and the print service is running.

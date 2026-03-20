@@ -17,6 +17,7 @@ use crate::menu::{self, ContextMenuState, MenuState};
 use crate::message::{
     DialogKind, FindDirection, FontChoice, FontStyleChoice, MenuId, Message, PendingAction,
 };
+use crate::settings;
 use crate::theme as t;
 
 pub struct RustPad {
@@ -69,6 +70,11 @@ pub struct RustPad {
 
 impl RustPad {
     pub fn new() -> (Self, Task<Message>) {
+        let (dark_mode, alert_message) = match settings::load() {
+            Ok(settings) => (settings.dark_mode, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
+
         (
             Self {
                 content: text_editor::Content::new(),
@@ -76,7 +82,7 @@ impl RustPad {
                 is_dirty: false,
                 undo_snapshot: None,
                 word_wrap: false,
-                dark_mode: false,
+                dark_mode,
                 font_size: 16.0,
                 font_family: FontChoice::Monospace,
                 font_style: FontStyleChoice::Regular,
@@ -95,7 +101,7 @@ impl RustPad {
                 find_whole_word: false,
                 find_direction: FindDirection::Down,
                 goto_line_text: String::new(),
-                alert_message: None,
+                alert_message,
                 show_status_bar: true, // on when word_wrap is off
                 pending_action: None,
             },
@@ -345,6 +351,9 @@ impl RustPad {
             }
             Message::ToggleDarkMode => {
                 self.dark_mode = !self.dark_mode;
+                if let Err(error) = self.persist_settings() {
+                    self.show_alert(error.to_string());
+                }
                 self.close_menus();
                 Task::none()
             }
@@ -924,7 +933,7 @@ impl RustPad {
                         .size(13)
                         .width(Fill)
                         .align_x(iced::alignment::Horizontal::Center),
-                    text("Version 0.1.3")
+                    text(format!("Version {}", env!("CARGO_PKG_VERSION")))
                         .size(12)
                         .width(Fill)
                         .align_x(iced::alignment::Horizontal::Center),
@@ -1233,6 +1242,12 @@ impl RustPad {
 
     fn show_alert(&mut self, message: String) {
         self.alert_message = Some(message);
+    }
+
+    fn persist_settings(&self) -> Result<(), settings::SettingsError> {
+        settings::save(&settings::Settings {
+            dark_mode: self.dark_mode,
+        })
     }
 
     fn do_find_next(&mut self) {

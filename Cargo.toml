@@ -1,6 +1,6 @@
 [package]
 name = "rustpad"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "A lightweight Notepad style editor built with Rust and Iced"
 repository = "https://github.com/goshitsarch-eng/RustPad"
@@ -10,6 +10,7 @@ iced = { version = "0.14", features = ["tokio", "advanced"] }
 rfd = "0.15"
 chrono = "0.4"
 arboard = "3"
+dirs = "6"
 
 [package.metadata.packager]
 product-name = "RustPad"

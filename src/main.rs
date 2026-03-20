@@ -2,6 +2,7 @@ mod app;
 mod file_ops;
 mod menu;
 mod message;
+mod settings;
 mod theme;
 
 use app::RustPad;

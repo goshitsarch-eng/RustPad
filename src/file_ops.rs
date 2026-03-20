@@ -87,25 +87,12 @@ pub async fn print_file(contents: String) -> Result<(), FileError> {
     write_new_file(&tmp_path, contents.as_bytes())
         .map_err(|error| io_error("prepare print file", Some(tmp_path.clone()), error))?;
 
-    let output = Command::new("lp")
-        .arg(&tmp_path)
-        .output()
-        .map_err(|error| io_error("run lp", None, error))?;
-
+    let print_result = run_print_command(&tmp_path);
     let cleanup_result = fs::remove_file(&tmp_path);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let details = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            format!("lp exited with status {}", output.status)
-        };
-
-        return Err(FileError::PrintFailed(details));
+    if let Err(error) = print_result {
+        let _ = cleanup_result;
+        return Err(error);
     }
 
     if let Err(error) = cleanup_result {
@@ -117,6 +104,55 @@ pub async fn print_file(contents: String) -> Result<(), FileError> {
     }
 
     Ok(())
+}
+
+fn run_print_command(path: &Path) -> Result<(), FileError> {
+    let commands = print_commands(path);
+    let mut failures = Vec::new();
+
+    for (program, args) in commands {
+        match Command::new(program).args(&args).output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                let details = if !stderr.is_empty() {
+                    stderr
+                } else if !stdout.is_empty() {
+                    stdout
+                } else {
+                    format!("exited with status {}", output.status)
+                };
+                failures.push(format!("{program}: {details}"));
+            }
+            Err(error) => failures.push(format!("{program}: {error}")),
+        }
+    }
+
+    Err(FileError::PrintFailed(format!(
+        "no supported print command succeeded ({})",
+        failures.join("; ")
+    )))
+}
+
+#[cfg(target_os = "windows")]
+fn print_commands(path: &Path) -> Vec<(&'static str, Vec<String>)> {
+    vec![(
+        "notepad.exe",
+        vec!["/p".to_owned(), path.to_string_lossy().into_owned()],
+    )]
+}
+
+#[cfg(not(target_os = "windows"))]
+fn print_commands(path: &Path) -> Vec<(&'static str, Vec<String>)> {
+    let file = path.to_string_lossy().into_owned();
+
+    vec![
+        ("/usr/bin/lp", vec![file.clone()]),
+        ("lp", vec![file.clone()]),
+        ("/usr/bin/lpr", vec![file.clone()]),
+        ("lpr", vec![file]),
+    ]
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), FileError> {
